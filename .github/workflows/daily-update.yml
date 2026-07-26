@@ -1,0 +1,38 @@
+name: Daily Portfolio Update
+
+on:
+  schedule:
+    # 6 PM IST = 12:30 PM UTC
+    - cron: "30 12 * * 1-5"   # weekdays only (Mon–Fri)
+  workflow_dispatch:           # allow manual trigger from Actions tab
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run portfolio tracker
+        run: python portfolio.py
+
+      - name: Commit updated files
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/portfolio_tracker.xlsx docs/dashboard.html
+          if git diff --staged --quiet; then
+            echo "Nothing changed — skipping commit."
+          else
+            git commit -m "chore: daily portfolio update $(date -u +'%Y-%m-%d') [skip ci]"
+            git push
+          fi
