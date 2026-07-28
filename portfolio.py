@@ -31,10 +31,11 @@ IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 def parse_portfolio_file(path):
     """
-    Parse my_portfolio.txt into two lists of (display_name, ticker) tuples.
-    Sections are marked by [PORTFOLIO] and [BENCHMARKS].
+    Parse my_portfolio.txt into three lists of (display_name, ticker) tuples.
+    Sections: [PORTFOLIO], [PORTFOLIO_SECONDARY], [BENCHMARKS].
+    Secondary stocks are always rendered after primary with a divider.
     """
-    portfolio, benchmarks = [], []
+    portfolio, secondary, benchmarks = [], [], []
     section = None
     with open(path) as f:
         for line in f:
@@ -43,12 +44,19 @@ def parse_portfolio_file(path):
                 continue
             if line == '[PORTFOLIO]':
                 section = 'portfolio'
+            elif line == '[PORTFOLIO_SECONDARY]':
+                section = 'secondary'
             elif line == '[BENCHMARKS]':
                 section = 'benchmarks'
             elif '|' in line and section:
                 name, ticker = [x.strip() for x in line.split('|', 1)]
-                (portfolio if section == 'portfolio' else benchmarks).append((name, ticker))
-    return portfolio, benchmarks
+                if section == 'portfolio':
+                    portfolio.append((name, ticker))
+                elif section == 'secondary':
+                    secondary.append((name, ticker))
+                else:
+                    benchmarks.append((name, ticker))
+    return portfolio, secondary, benchmarks
 
 
 # ── Data fetch ────────────────────────────────────────────────────────────────
@@ -121,14 +129,17 @@ def rel_vol(volumes, window=20):
     return safe_round(rv.iloc[-1])
 
 
-def compute_portfolio_metrics(name, ticker, df):
-    """Compute all portfolio columns from a OHLCV DataFrame."""
-    if df is None or len(df) < 3:
-        print(f"  [SKIP] Not enough data for {ticker}")
+def compute_portfolio_metrics_at(name, ticker, df, idx):
+    """
+    Compute all portfolio metrics using only data available up to position `idx`.
+    Used both for today's dashboard and for backfilling missing history rows.
+    """
+    s = df.iloc[:idx + 1]
+    if len(s) < 3:
         return None
 
-    closes  = df['Close']
-    volumes = df['Volume']
+    closes  = s['Close']
+    volumes = s['Volume']
 
     today_px  = safe_round(closes.iloc[-1])
     yest_px   = safe_round(closes.iloc[-2])
@@ -139,7 +150,7 @@ def compute_portfolio_metrics(name, ticker, df):
     monthly_ret = safe_pct(today_px, closes.iloc[-22]) if len(closes) >= 22 else None
 
     relvol  = rel_vol(volumes)
-    z_score = overnight_z(df)
+    z_score = overnight_z(s)
 
     try:
         rsi = safe_round(rsi_14(closes), 1)
@@ -155,7 +166,7 @@ def compute_portfolio_metrics(name, ticker, df):
 
     return {
         'name': name, 'ticker': ticker,
-        'date': df.index[-1],
+        'date': s.index[-1],
         'yest_px': yest_px, 'today_px': today_px,
         'change_pct': safe_pct(today_px, yest_px),
         'weekly_ret': weekly_ret, 'monthly_ret': monthly_ret,
@@ -168,25 +179,45 @@ def compute_portfolio_metrics(name, ticker, df):
     }
 
 
-def compute_benchmark_metrics(name, ticker, df):
-    """Compute benchmark columns (smaller set) from a OHLCV DataFrame."""
+def compute_portfolio_metrics(name, ticker, df):
+    """Compute metrics for the most recent row (used for the dashboard)."""
     if df is None or len(df) < 3:
         print(f"  [SKIP] Not enough data for {ticker}")
         return None
+    m = compute_portfolio_metrics_at(name, ticker, df, len(df) - 1)
+    if m:
+        m['_df'] = df  # carry raw df for backfill use in update_excel
+    return m
 
-    closes = df['Close']
+
+def compute_benchmark_metrics_at(name, ticker, df, idx):
+    """Compute benchmark metrics using only data up to position `idx`."""
+    s = df.iloc[:idx + 1]
+    if len(s) < 3:
+        return None
+    closes   = s['Close']
     today_px = safe_round(closes.iloc[-1])
     yest_px  = safe_round(closes.iloc[-2])
-
     return {
         'name': name, 'ticker': ticker,
-        'date': df.index[-1],
+        'date': s.index[-1],
         'yest_px': yest_px, 'today_px': today_px,
         'change_pct': safe_pct(today_px, yest_px),
         'weekly_ret':  safe_pct(today_px, closes.iloc[-6])  if len(closes) >= 6  else None,
         'monthly_ret': safe_pct(today_px, closes.iloc[-22]) if len(closes) >= 22 else None,
-        'z_score': overnight_z(df),
+        'z_score': overnight_z(s),
     }
+
+
+def compute_benchmark_metrics(name, ticker, df):
+    """Compute benchmark metrics for the most recent row (used for the dashboard)."""
+    if df is None or len(df) < 3:
+        print(f"  [SKIP] Not enough data for {ticker}")
+        return None
+    m = compute_benchmark_metrics_at(name, ticker, df, len(df) - 1)
+    if m:
+        m['_df'] = df
+    return m
 
 
 # ── Expiry dates ──────────────────────────────────────────────────────────────
@@ -220,88 +251,62 @@ def get_expiry_info(today):
       Bank Nifty                    → last Wednesday of month (monthly)
                                     → every Wednesday         (weekly)
     """
-    wd = today.weekday()  # 0=Mon, 1=Tue, 2=Wed, 3=Thu
-
-    # ── Compute key dates ────────────────────────────────────────────────────
-    last_tue = last_weekday_of_month(today.year, today.month, 1)  # stock F&O
-    last_thu = last_weekday_of_month(today.year, today.month, 3)  # Nifty monthly
-    last_wed = last_weekday_of_month(today.year, today.month, 2)  # BankNifty monthly
-
-    # Next weekly Thursday (Nifty) — if today is Thu, next occurrence is +7
-    days_to_thu = (3 - wd) % 7 or 7
-    next_thu    = today + datetime.timedelta(days=days_to_thu)
-    # On the last Thursday, weekly == monthly — use last_thu
-    nifty_next  = last_thu if last_thu >= today and days_until(last_thu, today) <= days_to_thu else next_thu
-
-    # Next weekly Wednesday (BankNifty)
-    days_to_wed = (2 - wd) % 7 or 7
-    next_wed    = today + datetime.timedelta(days=days_to_wed)
-    bnf_next    = last_wed if last_wed >= today and days_until(last_wed, today) <= days_to_wed else next_wed
-
-    # ── Build expiry cards ───────────────────────────────────────────────────
+    # Stock F&O monthly expiry = last Tuesday of the month
+    last_tue   = last_weekday_of_month(today.year, today.month, 1)
     stock_days = days_until(last_tue, today)
+
     # If last Tuesday already passed this month, roll to next month
     if stock_days < 0:
-        nm = today.month % 12 + 1
-        ny = today.year + (1 if today.month == 12 else 0)
+        nm       = today.month % 12 + 1
+        ny       = today.year + (1 if today.month == 12 else 0)
         last_tue   = last_weekday_of_month(ny, nm, 1)
         stock_days = days_until(last_tue, today)
 
-    nifty_days = days_until(nifty_next, today)
-    bnf_days   = days_until(bnf_next, today)
-
-    def card(label, exp_date, d):
-        is_monthly = (exp_date == last_weekday_of_month(exp_date.year, exp_date.month, exp_date.weekday()))
-        tag = " (Monthly)" if is_monthly else " (Weekly)"
-        return {
-            'label':    label + tag,
-            'date':     exp_date,
-            'days':     d,
-            'is_today': d == 0,
-        }
-
     expiries = [
-        card("Stock F&O",  last_tue,   stock_days),
-        card("Nifty 50",   nifty_next, nifty_days),
-        card("Bank Nifty", bnf_next,   bnf_days),
+        {
+            'label':    'Stock F&O Expiry',
+            'date':     last_tue,
+            'days':     stock_days,
+            'is_today': stock_days == 0,
+        }
     ]
 
-    is_expiry_today = any(e['is_today'] for e in expiries)
+    is_expiry_today = expiries[0]['is_today']
     return is_expiry_today, expiries
 
 
 # ── Excel output ──────────────────────────────────────────────────────────────
 
 PORTFOLIO_HEADERS = [
-    'Date', 'Prev Price', 'Today Price', 'Change %',
-    'Weekly Ret %', 'Monthly Ret %', 'Prev Vol', 'Today Vol',
+    'Date', 'Today', 'Yesterday', 'Change %',
+    'Weekly Ret %', 'Monthly Ret %', 'Today Vol', 'Yesterday Vol',
     'RelVol', 'Z Score', 'RSI', '200 DMA', '50 DMA',
-    '52W High', '52W Low', 'From High %', 'From Low %',
+    '52W High', 'From High %', '52W Low', 'From Low %',
 ]
 
 BENCHMARK_HEADERS = [
-    'Date', 'Prev Price', 'Today Price', 'Change %',
+    'Date', 'Today', 'Yesterday', 'Change %',
     'Weekly Ret %', 'Monthly Ret %', 'Z Score',
 ]
 
 
 def row_from_portfolio(d):
     return [
-        d['date'], d['yest_px'], d['today_px'], d['change_pct'],
-        d['weekly_ret'], d['monthly_ret'], d['yest_vol'], d['today_vol'],
+        d['date'], d['today_px'], d['yest_px'], d['change_pct'],
+        d['weekly_ret'], d['monthly_ret'], d['today_vol'], d['yest_vol'],
         d['relvol'], d['z_score'], d['rsi'], d['dma200'], d['dma50'],
-        d['high_52w'], d['low_52w'], d['from_high'], d['from_low'],
+        d['high_52w'], d['from_high'], d['low_52w'], d['from_low'],
     ]
 
 
 def row_from_benchmark(d):
     return [
-        d['date'], d['yest_px'], d['today_px'], d['change_pct'],
+        d['date'], d['today_px'], d['yest_px'], d['change_pct'],
         d['weekly_ret'], d['monthly_ret'], d['z_score'],
     ]
 
 
-def update_excel(portfolio_data, benchmark_data, today):
+def update_excel(portfolio_data, secondary_data, benchmark_data, today):
     """Rebuild the Dashboard sheet and append one row per stock to its History sheet."""
     os.makedirs(os.path.dirname(EXCEL_PATH), exist_ok=True)
 
@@ -317,10 +322,17 @@ def update_excel(portfolio_data, benchmark_data, today):
     dash = wb.create_sheet('Dashboard', 0)
 
     dash.append(['PORTFOLIO'])
-    dash.append(['Stock', 'Ticker'] + PORTFOLIO_HEADERS[1:])  # skip 'Date' on dashboard
+    dash.append(['Stock', 'Ticker'] + PORTFOLIO_HEADERS[1:])
     for d in portfolio_data:
         if d:
             dash.append([d['name'], d['ticker']] + row_from_portfolio(d)[1:])
+
+    # Divider row for transferred account stocks
+    if secondary_data:
+        dash.append(['── Transferred Account ──'])
+        for d in secondary_data:
+            if d:
+                dash.append([d['name'], d['ticker']] + row_from_portfolio(d)[1:])
 
     dash.append([])
     dash.append(['BENCHMARKS'])
@@ -329,12 +341,11 @@ def update_excel(portfolio_data, benchmark_data, today):
         if d:
             dash.append([d['name'], d['ticker']] + row_from_benchmark(d)[1:])
 
-    # ── Append to History sheets ──────────────────────────────────────────────
-    all_items = [(d, 'portfolio') for d in portfolio_data if d] + \
+    # ── Append to History sheets (with backfill for missed days) ─────────────
+    all_items = [(d, 'portfolio') for d in portfolio_data + secondary_data if d] + \
                 [(d, 'benchmark') for d in benchmark_data if d]
 
     for d, kind in all_items:
-        # Build a safe sheet name: strip exchange suffixes and special chars
         raw = d['ticker'].replace('.NS', '').replace('.BO', '')
         raw = ''.join(c for c in raw if c.isalnum() or c in ('_', '-'))
         sheet_name = (raw + '_HIST')[:31]
@@ -345,13 +356,47 @@ def update_excel(portfolio_data, benchmark_data, today):
         else:
             hs = wb[sheet_name]
 
-        # Skip if today's date already exists
-        existing = {str(r[0]) for r in hs.iter_rows(min_row=2, values_only=True) if r[0]}
-        if str(today) not in existing:
-            hs.append(row_from_portfolio(d) if kind == 'portfolio' else row_from_benchmark(d))
-            print(f"  [HIST] Appended row to {sheet_name}")
+        # Collect dates already stored — normalise to YYYY-MM-DD
+        # (openpyxl may return datetime objects like '2026-07-24 00:00:00')
+        existing = {str(r[0])[:10] for r in hs.iter_rows(min_row=2, values_only=True) if r[0]}
+
+        # Use the raw DataFrame carried in the metrics dict to backfill
+        df_raw = d.get('_df')
+        if df_raw is None:
+            continue
+
+        # For new stocks write only today's row.
+        # For existing stocks backfill only from the last stored date onwards.
+        if existing:
+            last_stored = max(datetime.date.fromisoformat(s) for s in existing)
+            backfill_from = last_stored
         else:
-            print(f"  [HIST] {sheet_name} already has today's data — skipped")
+            backfill_from = today  # new stock — start from today only
+
+        added = 0
+        for i, date in enumerate(df_raw.index):
+            if str(date)[:10] in existing:
+                continue          # already stored
+            if date < backfill_from:
+                continue          # before our backfill window
+            if date > today:
+                continue          # don't write future dates
+
+            if kind == 'portfolio':
+                row_m = compute_portfolio_metrics_at(d['name'], d['ticker'], df_raw, i)
+                if row_m:
+                    hs.append(row_from_portfolio(row_m))
+                    added += 1
+            else:
+                row_m = compute_benchmark_metrics_at(d['name'], d['ticker'], df_raw, i)
+                if row_m:
+                    hs.append(row_from_benchmark(row_m))
+                    added += 1
+
+        if added > 0:
+            print(f"  [HIST] {sheet_name}: added {added} row(s) (backfilled missing days)")
+        else:
+            print(f"  [HIST] {sheet_name}: already up-to-date")
 
     wb.save(EXCEL_PATH)
     print(f"[EXCEL] Saved: {EXCEL_PATH}")
@@ -375,7 +420,7 @@ def _pct(val):
     return f'<td class="{cls}">{arrow}&nbsp;{val}%</td>'
 
 
-def generate_html(portfolio_data, benchmark_data, today, expiries, is_expiry):
+def generate_html(portfolio_data, secondary_data, benchmark_data, today, expiries, is_expiry):
     """Generate a mobile-friendly dark-theme HTML dashboard."""
     os.makedirs(os.path.dirname(HTML_PATH), exist_ok=True)
 
@@ -395,22 +440,34 @@ def generate_html(portfolio_data, benchmark_data, today, expiries, is_expiry):
             badge = f"{e['label']} — {e['days']}d ({e['date'].strftime('%d %b')})"
         expiry_html += f'<span class="badge" style="background:{bg}">{badge}</span>\n'
 
+    def _port_row(d):
+        return f"""
+        <tr>
+          <td class="sname">{d['name']}<br><small>{d['ticker']}</small></td>
+          {_td(d['today_px'])} {_td(d['yest_px'])} {_pct(d['change_pct'])}
+          {_pct(d['weekly_ret'])} {_pct(d['monthly_ret'])}
+          {_td(d['today_vol'])} {_td(d['yest_vol'])}
+          {_td(d['relvol'])} {_td(d['z_score'])} {_td(d['rsi'])}
+          {_td(d['dma200'])} {_td(d['dma50'])}
+          {_td(d['high_52w'])} {_pct(d['from_high'])}
+          {_td(d['low_52w'])} {_pct(d['from_low'])}
+        </tr>"""
+
     # Portfolio rows
     port_rows = ''
     for d in portfolio_data:
-        if not d:
-            continue
-        port_rows += f"""
-        <tr>
-          <td class="sname">{d['name']}<br><small>{d['ticker']}</small></td>
-          {_td(d['yest_px'])} {_td(d['today_px'])} {_pct(d['change_pct'])}
-          {_pct(d['weekly_ret'])} {_pct(d['monthly_ret'])}
-          {_td(d['yest_vol'])} {_td(d['today_vol'])}
-          {_td(d['relvol'])} {_td(d['z_score'])} {_td(d['rsi'])}
-          {_td(d['dma200'])} {_td(d['dma50'])}
-          {_td(d['high_52w'])} {_td(d['low_52w'])}
-          {_pct(d['from_high'])} {_pct(d['from_low'])}
-        </tr>"""
+        if d:
+            port_rows += _port_row(d)
+
+    # Divider + secondary rows
+    if secondary_data:
+        port_rows += '''
+        <tr class="divider">
+          <td colspan="17">Transferred Account</td>
+        </tr>'''
+        for d in secondary_data:
+            if d:
+                port_rows += _port_row(d)
 
     # Benchmark rows
     bench_rows = ''
@@ -420,7 +477,7 @@ def generate_html(portfolio_data, benchmark_data, today, expiries, is_expiry):
         bench_rows += f"""
         <tr>
           <td class="sname">{d['name']}<br><small>{d['ticker']}</small></td>
-          {_td(d['yest_px'])} {_td(d['today_px'])} {_pct(d['change_pct'])}
+          {_td(d['today_px'])} {_td(d['yest_px'])} {_pct(d['change_pct'])}
           {_pct(d['weekly_ret'])} {_pct(d['monthly_ret'])}
           {_td(d['z_score'])}
         </tr>"""
@@ -457,6 +514,10 @@ def generate_html(portfolio_data, benchmark_data, today, expiries, is_expiry):
     .pos{{color:#27ae60;font-weight:700}}
     .neg{{color:#e74c3c;font-weight:700}}
     .na{{color:#333}}
+    .divider td{{background:#1a1d2a;color:#666;font-size:10px;font-weight:700;
+                text-transform:uppercase;letter-spacing:1px;padding:4px 8px;
+                border-top:1px solid #3a3f55;border-bottom:1px solid #3a3f55;
+                text-align:left !important}}
     .footer{{margin-top:16px;color:#444;font-size:10px;text-align:center}}
   </style>
 </head>
@@ -469,11 +530,11 @@ def generate_html(portfolio_data, benchmark_data, today, expiries, is_expiry):
   <div class="sec">Portfolio</div>
   <div class="wrap"><table>
     <thead><tr>
-      <th>Stock</th><th>Prev</th><th>Today</th><th>Chg%</th>
-      <th>Wk%</th><th>Mo%</th><th>Prev Vol</th><th>Today Vol</th>
+      <th>Stock</th><th>Today</th><th>Yesterday</th><th>Chg%</th>
+      <th>Wk%</th><th>Mo%</th><th>Today Vol</th><th>Yest Vol</th>
       <th>RelVol</th><th>Z Score</th><th>RSI</th>
-      <th>200 DMA</th><th>50 DMA</th><th>52W H</th><th>52W L</th>
-      <th>↓High%</th><th>↑Low%</th>
+      <th>200 DMA</th><th>50 DMA</th><th>52W H</th><th>↓High%</th>
+      <th>52W L</th><th>↑Low%</th>
     </tr></thead>
     <tbody>{port_rows}</tbody>
   </table></div>
@@ -481,7 +542,7 @@ def generate_html(portfolio_data, benchmark_data, today, expiries, is_expiry):
   <div class="sec">Macro / Benchmarks</div>
   <div class="wrap"><table>
     <thead><tr>
-      <th>Index / Asset</th><th>Prev</th><th>Today</th><th>Chg%</th>
+      <th>Index / Asset</th><th>Today</th><th>Yesterday</th><th>Chg%</th>
       <th>Wk%</th><th>Mo%</th><th>Z Score</th>
     </tr></thead>
     <tbody>{bench_rows}</tbody>
@@ -511,9 +572,10 @@ def main():
         print(f"[ERROR] {PORTFOLIO_FILE} not found.")
         return
 
-    portfolio_stocks, benchmark_stocks = parse_portfolio_file(PORTFOLIO_FILE)
-    print(f"\n[INFO] Portfolio : {[t for _, t in portfolio_stocks]}")
-    print(f"[INFO] Benchmarks: {[t for _, t in benchmark_stocks]}")
+    portfolio_stocks, secondary_stocks, benchmark_stocks = parse_portfolio_file(PORTFOLIO_FILE)
+    print(f"\n[INFO] Portfolio  : {[t for _, t in portfolio_stocks]}")
+    print(f"[INFO] Secondary  : {[t for _, t in secondary_stocks]}")
+    print(f"[INFO] Benchmarks : {[t for _, t in benchmark_stocks]}")
 
     today = datetime.date.today()
 
@@ -524,6 +586,15 @@ def main():
         df = fetch_history(ticker)
         m = compute_portfolio_metrics(name, ticker, df)
         portfolio_data.append(m)
+        if m:
+            print(f"  Today: ₹{m['today_px']} | Change: {m['change_pct']}%")
+
+    secondary_data = []
+    for name, ticker in secondary_stocks:
+        print(f"\n[FETCH] {name} ({ticker})")
+        df = fetch_history(ticker)
+        m = compute_portfolio_metrics(name, ticker, df)
+        secondary_data.append(m)
         if m:
             print(f"  Today: ₹{m['today_px']} | Change: {m['change_pct']}%")
 
@@ -544,8 +615,8 @@ def main():
         print(f"  [EXPIRY] {e['label']} — {e['date']} ({tag})")
 
     # ── Write outputs ─────────────────────────────────────────────────────────
-    update_excel(portfolio_data, benchmark_data, today)
-    generate_html(portfolio_data, benchmark_data, today, expiries, is_expiry)
+    update_excel(portfolio_data, secondary_data, benchmark_data, today)
+    generate_html(portfolio_data, secondary_data, benchmark_data, today, expiries, is_expiry)
 
     print("\nDone.")
 

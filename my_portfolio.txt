@@ -4,15 +4,19 @@
 # Lines starting with # are comments and ignored.
 
 [PORTFOLIO]
-BFL Asset Finance      | BFLAFL.BO
 Dynamic Cables         | DYCL.NS
+South Indian Bank      | SOUTHBANK.NS
 ITC                    | ITC.NS
 Natco Pharma           | NATCOPHARM.NS
+Ujjivan SFB            | UJJIVANSFB.NS
+Yatharth Hospital      | YATHARTH.NS
+
+[PORTFOLIO_SECONDARY]
+# Transferred from another account — always shown at the bottom
+BFL Asset Finance      | BFLAFL.BO
 Premier Energy         | PREMIERENE.NS
 Renuka Sugar           | RENUKA.NS
-Ujjivan SFB            | UJJIVANSFB.NS
 Vishwaraj Sugar        | VISHWARAJ.NS
-Yatharth Hospital      | YATHARTH.NS
 
 [BENCHMARKS]
 Nifty 50               | ^NSEI
